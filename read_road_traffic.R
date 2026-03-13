@@ -1,5 +1,6 @@
 library(readxl)
 library(dplyr)
+library(tidyr)
 library(purrr)
 library(lubridate)
 library(synthdid)
@@ -77,57 +78,74 @@ glimpse(road_traffic)
 #   Control units : all other stations
 #   Treatment date: September 2022
 
-treat_date <- as.Date("2022-09-01")
-
-road_traffic_sdid <- road_traffic %>%
-  mutate(
-    treated_unit = ct %in% c("ZH", "FR"),
-    treatment    = as.integer(treated_unit & month >= treat_date)
-  )
+treat_date    <- as.Date("2022-09-01")
+treat_time_id <- as.integer(format(treat_date, "%Y%m"))   # 202209
 
 # ── Balance the panel ────────────────────────────────────────────────────────
-# synthdid requires a balanced panel (every unit present in every period).
-# Keep only stations observed in ALL time periods and with no missing outcome.
+# synthdid_estimate() requires a balanced panel (every unit × every period).
+# Keep only stations observed in ALL time periods with no missing outcome.
 
-total_months <- n_distinct(road_traffic_sdid$month)
+total_months <- n_distinct(road_traffic$month)
 
-balanced_nrs <- road_traffic_sdid %>%
+balanced_nrs <- road_traffic %>%
   filter(!is.na(traffic_mo_su)) %>%
   group_by(nr) %>%
   summarise(n_months = n_distinct(month), .groups = "drop") %>%
   filter(n_months == total_months) %>%
   pull(nr)
 
-panel_long <- road_traffic_sdid %>%
-  filter(nr %in% balanced_nrs) %>%
-  # Use integer time label YYYYMM so periods are clearly ordered and labelled
-  mutate(time = as.integer(format(month, "%Y%m"))) %>%
-  select(unit = nr, time, outcome = traffic_mo_su, treatment) %>%
-  arrange(unit, time)
+# Split into treated (ZH/FR) and control stations
+treated_balanced <- road_traffic %>%
+  filter(nr %in% balanced_nrs, ct %in% c("ZH", "FR")) %>%
+  distinct(nr) %>%
+  pull(nr)
+
+control_balanced <- setdiff(balanced_nrs, treated_balanced)
 
 cat(sprintf(
-  "Balanced panel: %d stations × %d months (%d treated, %d control)\n",
-  n_distinct(panel_long$unit),
-  n_distinct(panel_long$time),
-  n_distinct(panel_long$unit[panel_long$treatment == 1]),
-  n_distinct(panel_long$unit[panel_long$treatment == 0])
+  "Balanced panel: %d stations (%d treated ZH/FR, %d control), %d months\n",
+  length(balanced_nrs), length(treated_balanced),
+  length(control_balanced), total_months
 ))
 
-# ── Prepare matrices for synthdid ────────────────────────────────────────────
-# panel.matrices() converts the long data frame into the Y outcome matrix,
-# and returns N0 (# control units) and T0 (# pre-treatment periods) needed
-# by synthdid_estimate().
+# ── Build Y matrix manually ───────────────────────────────────────────────────
+# Bypass panel.matrices() and construct Y, N0, T0 directly so we have full
+# control over unit ordering (control rows first) and column ordering (time asc).
+#
+# Y  : (N0 + N1) × T matrix of outcomes
+# N0 : number of control units  (rows 1 … N0)
+# T0 : number of pre-treatment periods (columns 1 … T0)
 
-setup <- panel.matrices(panel_long)
+Y_wide <- road_traffic %>%
+  filter(nr %in% balanced_nrs, !is.na(traffic_mo_su)) %>%
+  mutate(
+    time       = as.integer(format(month, "%Y%m")),
+    is_treated = nr %in% treated_balanced
+  ) %>%
+  select(nr, is_treated, time, traffic_mo_su) %>%
+  arrange(is_treated, nr) %>%                    # control units first
+  pivot_wider(names_from = time, values_from = traffic_mo_su,
+              names_sort = TRUE)                  # columns in time order
+
+Y  <- as.matrix(Y_wide %>% select(-nr, -is_treated))
+rownames(Y) <- Y_wide$nr
+
+N0 <- length(control_balanced)                   # number of control rows
+T0 <- sum(as.integer(colnames(Y)) < treat_time_id)  # pre-treatment columns
+
+cat(sprintf(
+  "Matrix Y: %d rows (%d control + %d treated) × %d cols (%d pre + %d post)\n",
+  nrow(Y), N0, nrow(Y) - N0, ncol(Y), T0, ncol(Y) - T0
+))
 
 # ── Estimation ───────────────────────────────────────────────────────────────
-tau_hat <- synthdid_estimate(setup$Y, setup$N0, setup$T0)
+tau_hat <- synthdid_estimate(Y, N0, T0)
 
 # Standard error via placebo variance method
 se <- sqrt(vcov(tau_hat, method = "placebo"))
 
-cat(sprintf("Synthetic DiD estimate : %+.1f vehicles/day\n",   as.numeric(tau_hat)))
-cat(sprintf("Std. error             :  %.1f\n",                 se))
+cat(sprintf("Synthetic DiD estimate : %+.1f vehicles/day\n", as.numeric(tau_hat)))
+cat(sprintf("Std. error             :  %.1f\n",               se))
 cat(sprintf("95%% CI                : (%+.1f, %+.1f)\n",
             as.numeric(tau_hat) - 1.96 * se,
             as.numeric(tau_hat) + 1.96 * se))
