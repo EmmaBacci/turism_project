@@ -74,9 +74,9 @@ supply_and_demand <- supply_and_demand_stays_hotel_sector %>%
     Overnight_stays_2019_second_half = mean(Arrivals, na.rm = TRUE)
   ) %>%
   generate_weights(
-    optimization_window = as.numeric(as.yearmon("2005-01")):as.numeric(as.yearmon("2020-01"))
+    optimization_window = as.numeric(as.yearmon("2005-01")):as.numeric(as.yearmon("2019-12"))
   ) %>%
-  generate_control() %>% generate_weights()
+  generate_control() 
 #### Output and plots ####
 # Predictor and unit weights
 supply_and_demand %>% grab_predictor_weights()
